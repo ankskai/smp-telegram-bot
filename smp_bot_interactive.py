@@ -26,6 +26,11 @@ import os
 from typing import Optional
 import re
 from dotenv import load_dotenv
+import schedule
+import time
+import asyncio
+from threading import Thread
+from flask import Flask, jsonify
 
 from telegram import Update
 from telegram.ext import (
@@ -38,6 +43,9 @@ from telegram.ext import (
 
 # .env 파일에서 환경변수 로드
 load_dotenv()
+
+# Flask 앱 초기화
+app = Flask(__name__)
 
 # 로깅 설정
 logging.basicConfig(
@@ -366,7 +374,23 @@ class InteractiveSMPBot:
             MessageHandler(filters.TEXT & ~filters.COMMAND, self.handle_message)
         )
         
-        logger.info("핸들러 설정 완료 (육지 + 제주)")
+        # 에러 핸들러 추가
+        self.application.add_error_handler(self.error_handler)
+        
+        logger.info("핸들러 설정 완료 (육지 + 제주 + 에러 핸들러)")
+    
+    async def error_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """에러 핸들러"""
+        logger.error(f"봇 에러 발생: {context.error}")
+        
+        # 텔레그램 충돌 에러 처리
+        if "Conflict" in str(context.error):
+            logger.warning("텔레그램 봇 충돌 감지 - 잠시 대기 후 재시도")
+            await asyncio.sleep(5)  # 5초 대기
+            return
+        
+        # 기타 에러는 로그만 남기고 계속 실행
+        logger.error(f"예상치 못한 에러: {context.error}")
     
     async def start_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """
@@ -646,21 +670,121 @@ class InteractiveSMPBot:
         
         return parts
     
+    async def send_scheduled_report(self):
+        """스케줄된 SMP 리포트 전송"""
+        try:
+            logger.info("=" * 70)
+            logger.info("스케줄된 SMP 리포트 전송 시작")
+            logger.info("=" * 70)
+            
+            # 지난주 일요일 날짜 계산 (월요일 기준)
+            today = datetime.now()
+            if today.weekday() == 0:  # 월요일
+                last_sunday = today - timedelta(days=1)
+                target_date = last_sunday.strftime('%Y-%m-%d')
+                logger.info(f"📅 월요일 스케줄 실행 - 지난주 일요일: {target_date}")
+            else:
+                target_date = None
+                logger.info("월요일이 아님 - 최신 데이터 조회")
+            
+            # 데이터 크롤링
+            df = self.crawler.fetch_smp_data(target_date)
+            
+            if df is None:
+                error_msg = "❌ SMP 데이터를 가져오는데 실패했습니다."
+                logger.error(error_msg)
+                return
+            
+            # 메시지 포맷팅
+            message = self.crawler.format_smp_data(df)
+            
+            # 모든 채팅방에 전송 (여러 사용자가 사용하는 경우)
+            chat_id = os.getenv('TELEGRAM_CHAT_ID')
+            if chat_id:
+                await self.application.bot.send_message(
+                    chat_id=chat_id,
+                    text=f"📊 <b>주간 SMP 리포트</b>\n\n{message}",
+                    parse_mode='HTML'
+                )
+                logger.info("스케줄된 리포트 전송 완료")
+            
+        except Exception as e:
+            logger.error(f"스케줄된 리포트 전송 중 오류: {e}", exc_info=True)
+    
+    def run_scheduled_task(self):
+        """스케줄러에서 호출할 동기 메서드"""
+        logger.info("스케줄된 작업 실행")
+        asyncio.run(self.send_scheduled_report())
+    
     def run(self):
         """봇 실행"""
         logger.info("봇 실행 시작")
         print("\n" + "=" * 70)
-        print("✅ 대화형 SMP 텔레그램 봇이 시작되었습니다!")
+        print("✅ 통합 SMP 텔레그램 봇이 시작되었습니다!")
         print("=" * 70)
         print("📱 텔레그램에서 봇과 대화를 시작하세요!")
         print("💬 '오늘', '이번주' 또는 날짜를 입력하세요")
+        print("📅 매주 월요일 오전 9시에 자동 리포트 전송")
         print("❓ 도움말: /help")
         print("⏸️  종료: Ctrl+C")
         print("=" * 70 + "\n")
         
-        # 봇 실행
-        self.application.run_polling(allowed_updates=Update.ALL_TYPES)
+        # 스케줄 설정: 매주 월요일 오전 9시
+        schedule.every().monday.at("09:00").do(self.run_scheduled_task)
+        logger.info("스케줄 설정 완료: 매주 월요일 오전 9시")
+        
+        # 스케줄러를 별도 스레드에서 실행
+        def run_scheduler():
+            while True:
+                schedule.run_pending()
+                time.sleep(60)  # 1분마다 체크
+        
+        scheduler_thread = Thread(target=run_scheduler, daemon=True)
+        scheduler_thread.start()
+        logger.info("스케줄러 스레드 시작")
+        
+        # 봇 실행 (더 안정적인 방식)
+        try:
+            self.application.run_polling(
+                allowed_updates=Update.ALL_TYPES,
+                drop_pending_updates=True,  # 대기 중인 업데이트 무시
+                close_loop=False
+            )
+        except Exception as e:
+            logger.error(f"봇 실행 중 오류: {e}")
+            # 오류 발생 시 잠시 대기 후 재시도
+            time.sleep(10)
+            self.application.run_polling(allowed_updates=Update.ALL_TYPES)
 
+
+# Flask 헬스체크 엔드포인트
+@app.route('/')
+def home():
+    """메인 헬스체크 엔드포인트"""
+    logger.info("헬스체크 요청 수신")
+    return jsonify({
+        'status': 'OK',
+        'message': '통합 SMP 텔레그램 봇이 정상 작동 중입니다.',
+        'timestamp': datetime.now().isoformat(),
+        'timezone': 'Asia/Seoul',
+        'schedule': '매주 월요일 오전 9시',
+        'features': ['자동 스케줄', '대화형 조회', '육지/제주 데이터']
+    })
+
+@app.route('/health')
+def health():
+    """간단한 헬스체크 엔드포인트"""
+    logger.info("간단한 헬스체크 요청 수신")
+    return 'OK', 200
+
+def run_flask_app():
+    """Flask 앱을 별도 스레드에서 실행"""
+    port = int(os.getenv('PORT', 10000))
+    logger.info(f"Flask 서버 시작 - 포트: {port}")
+    try:
+        app.run(host='0.0.0.0', port=port, debug=False, use_reloader=False)
+    except Exception as e:
+        logger.error(f"Flask 서버 시작 실패: {e}")
 
 def main():
     """메인 함수"""
@@ -677,7 +801,16 @@ def main():
         return
     
     try:
-        # 대화형 봇 생성 및 실행
+        # Flask 서버를 먼저 시작
+        logger.info("Flask 서버 스레드 시작")
+        flask_thread = Thread(target=run_flask_app, daemon=True)
+        flask_thread.start()
+        logger.info("Flask 서버 스레드 시작 완료")
+        
+        # 잠시 대기하여 Flask 서버가 완전히 시작되도록 함
+        time.sleep(2)
+        
+        # 통합 봇 생성 및 실행
         bot = InteractiveSMPBot(token)
         bot.run()
         
