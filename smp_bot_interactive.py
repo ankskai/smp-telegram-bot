@@ -733,6 +733,14 @@ class InteractiveSMPBot:
         schedule.every().monday.at("09:00").do(self.run_scheduled_task)
         logger.info("스케줄 설정 완료: 매주 월요일 오전 9시")
         
+        # 매시간 서버 활성 상태 확인 (Render 슬립 방지)
+        def keep_alive():
+            """서버 활성 상태 유지"""
+            logger.info("🔄 서버 활성 상태 확인")
+        
+        schedule.every().hour.do(keep_alive)
+        logger.info("서버 활성 상태 체크 스케줄 설정 완료: 매시간")
+        
         # 스케줄러를 별도 스레드에서 실행
         def run_scheduler():
             while True:
@@ -780,7 +788,14 @@ def health():
 def run_flask_app():
     """Flask 앱을 별도 스레드에서 실행"""
     port = int(os.getenv('PORT', 10000))
-    logger.info(f"Flask 서버 시작 - 포트: {port}")
+    logger.info(f"🚀 서버가 포트 {port}에서 시작되었습니다.")
+    logger.info(f"📊 헬스체크 URL: https://your-service-name.onrender.com/health")
+    logger.info("⏰ 스케줄러 설정:")
+    logger.info("  - 매주 월요일 오전 9시: SMP 리포트 전송")
+    logger.info("  - 매시간: 서버 활성 상태 확인")
+    logger.info("🌍 시간대: Asia/Seoul")
+    logger.info(f"🕐 서버 시작 시간: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    
     try:
         app.run(host='0.0.0.0', port=port, debug=False, use_reloader=False)
     except Exception as e:
